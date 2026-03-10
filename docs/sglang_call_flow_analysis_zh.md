@@ -49,6 +49,54 @@ if __name__ == "__main__":
 
 ### 2.3 FastAPI 生命周期钩子
 `lifespan(...)` 在服务“可用前”初始化 OpenAI 适配 handler：
+
+# SGLang 代码调用逻辑总览（从入口函数出发）
+
+本文从**启动入口**开始，梳理 SGLang 在 `python/sglang` 目录下的主要调用链路，重点覆盖：
+
+- HTTP 服务模式（`launch_server.py`）
+- Python Engine 模式（`Engine`）
+- 请求在 Tokenizer/Scheduler/Detokenizer 三段流水线中的流转
+- OpenAI 兼容接口如何适配为内部请求
+- `sglang` DSL（`api.py`）如何连接到 runtime
+
+---
+
+## 1. 启动入口（CLI）
+
+### 1.1 文件入口
+- 入口文件：`python/sglang/launch_server.py`
+- 主流程：
+  1. `prepare_server_args(sys.argv[1:])` 解析启动参数。
+  2. `launch_server(server_args)` 启动 HTTP + 引擎。
+  3. `finally` 中调用 `kill_process_tree(...)`，确保子进程收敛退出。
+
+对应调用顺序：
+
+```text
+python -m sglang.launch_server / sglang.launch_server.py
+  -> prepare_server_args(...)
+  -> sglang.srt.entrypoints.http_server.launch_server(server_args)
+  -> (退出时) kill_process_tree(...)
+```
+
+---
+
+## 2. HTTP 服务主干（FastAPI）
+
+### 2.1 `http_server.launch_server` 核心职责
+`python/sglang/srt/entrypoints/http_server.py::launch_server` 会：
+
+1. 调用 `_launch_subprocesses(server_args)` 拉起 runtime 子系统。
+2. 把 `TokenizerManager / TemplateManager / scheduler_info` 写入全局状态。
+3. 注册 API Key 中间件、Prometheus 中间件（可选）。
+4. 启动 warmup 线程。
+5. `uvicorn.run(app, ...)` 对外提供 HTTP 服务。
+
+### 2.2 FastAPI 生命周期
+`lifespan(...)` 在服务就绪阶段初始化 OpenAI handler：
+
+ main
 - `OpenAIServingCompletion`
 - `OpenAIServingChat`
 - `OpenAIServingEmbedding`
