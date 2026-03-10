@@ -1,444 +1,373 @@
-# SGLang 代码调用逻辑深度解析（从入口函数出发）
+# SGLang 调用逻辑深度分析（从入口函数到一次 decode 迭代）
 
-> 目标：从**入口函数**一路追到**模型前向与回包**，把关键模块、关键函数、关键数据结构串成可执行的“读码地图”。
-
----
-
-## 1. 总体架构先看结论
-
-SGLang Runtime（SRT）在服务模式下是一个**1 主进程 + 多子进程**的结构：
-
-- 主进程：FastAPI + `TokenizerManager`
-- 子进程 A：`Scheduler`（可能 1 个或多个，取决于 TP/PP/DP）
-- 子进程 B：`DetokenizerManager`
-
-核心思想：
-1. 主进程负责协议接入（HTTP/OpenAI）、请求规范化、tokenize、多模态预处理。
-2. Scheduler 负责 batching + 调度 + 调用模型 executor 前向。
-3. Detokenizer 负责把 token ids 增量解码成文本再回传主进程。
-
-进程间通信统一通过 ZMQ IPC（`PUSH/PULL` 或 `DEALER`）完成。
+> 本文不是“模块介绍”，而是“可执行追踪图”：从入口函数开始，按真实调用顺序追到 scheduler event loop、模型 executor 与 detokenizer 回包。
 
 ---
 
-## 2. 入口函数与启动调用链
+## 0. 先给结论：你应该盯住的主链
 
-### 2.1 CLI 入口
+无论是 HTTP/OpenAI 接口，还是 Python `Engine` 直调，最终都会汇合到同一条主链：
+
+1. 入口层（CLI/FastAPI/Engine）构造 `ServerArgs`，拉起子进程拓扑。
+2. 请求进入 `TokenizerManager`，完成参数规范化、tokenize、多模态预处理、请求注册。
+3. `Scheduler` 从 IPC 收到 tokenized 请求，执行 admission + batching + prefill/decode 调度。
+4. 模型 executor 执行前向，输出 token ids / embedding / score。
+5. `DetokenizerManager` 把 token ids 增量解码成文本，裁剪 stop 条件后回传。
+6. `TokenizerManager` 把回包路由到 rid 对应的异步生成器，HTTP 层再封装 SSE 或一次性 JSON。
+
+---
+
+## 1. 入口一：CLI 到 HTTP Server
+
 文件：`python/sglang/launch_server.py`
 
-入口代码路径非常短：
+启动路径非常短，但它定义了“真正入口在哪”：
 
 ```text
 if __name__ == "__main__":
   server_args = prepare_server_args(sys.argv[1:])
   launch_server(server_args)
-  finally: kill_process_tree(...)
+  finally: kill_process_tree(os.getpid(), include_parent=False)
 ```
 
-这意味着你要追“真实启动逻辑”，应直接进入：
+所以真正需要深追的是：
+
 - `python/sglang/srt/entrypoints/http_server.py::launch_server`
 
-### 2.2 `http_server.launch_server` 的职责切分
-`launch_server(server_args)` 做了五件关键事：
+### 1.1 `http_server.launch_server` 做了什么
 
-1. `_launch_subprocesses(server_args)`：拉起引擎进程拓扑（最关键）。
-2. `set_global_state(...)`：把 `TokenizerManager/TemplateManager/scheduler_info` 注入全局。
-3. 条件注册中间件：API key 与 Prometheus。
-4. 准备 warmup 线程（延后在 FastAPI lifespan 阶段触发）。
-5. `uvicorn.run(...)` 启动 HTTP 监听。
+可以拆成 5 步：
 
-### 2.3 FastAPI 生命周期钩子
-`lifespan(...)` 在服务“可用前”初始化 OpenAI 适配 handler：
+1. `_launch_subprocesses(server_args)`：创建 runtime 进程图（最关键）。
+2. `set_global_state(...)`：把 `tokenizer_manager/template_manager/scheduler_info` 放到全局。
+3. 注册中间件（API key、Prometheus）。
+4. 准备 warmup thread。
+5. `uvicorn.run(...)`：开始监听。
 
-# SGLang 代码调用逻辑总览（从入口函数出发）
+### 1.2 `lifespan(...)` 是 OpenAI 适配层初始化点
 
-本文从**启动入口**开始，梳理 SGLang 在 `python/sglang` 目录下的主要调用链路，重点覆盖：
+FastAPI 生命周期里会创建：
 
-- HTTP 服务模式（`launch_server.py`）
-- Python Engine 模式（`Engine`）
-- 请求在 Tokenizer/Scheduler/Detokenizer 三段流水线中的流转
-- OpenAI 兼容接口如何适配为内部请求
-- `sglang` DSL（`api.py`）如何连接到 runtime
-
----
-
-## 1. 启动入口（CLI）
-
-### 1.1 文件入口
-- 入口文件：`python/sglang/launch_server.py`
-- 主流程：
-  1. `prepare_server_args(sys.argv[1:])` 解析启动参数。
-  2. `launch_server(server_args)` 启动 HTTP + 引擎。
-  3. `finally` 中调用 `kill_process_tree(...)`，确保子进程收敛退出。
-
-对应调用顺序：
-
-```text
-python -m sglang.launch_server / sglang.launch_server.py
-  -> prepare_server_args(...)
-  -> sglang.srt.entrypoints.http_server.launch_server(server_args)
-  -> (退出时) kill_process_tree(...)
-```
-
----
-
-## 2. HTTP 服务主干（FastAPI）
-
-### 2.1 `http_server.launch_server` 核心职责
-`python/sglang/srt/entrypoints/http_server.py::launch_server` 会：
-
-1. 调用 `_launch_subprocesses(server_args)` 拉起 runtime 子系统。
-2. 把 `TokenizerManager / TemplateManager / scheduler_info` 写入全局状态。
-3. 注册 API Key 中间件、Prometheus 中间件（可选）。
-4. 启动 warmup 线程。
-5. `uvicorn.run(app, ...)` 对外提供 HTTP 服务。
-
-### 2.2 FastAPI 生命周期
-`lifespan(...)` 在服务就绪阶段初始化 OpenAI handler：
-
- main
-- `OpenAIServingCompletion`
 - `OpenAIServingChat`
+- `OpenAIServingCompletion`
 - `OpenAIServingEmbedding`
 - `OpenAIServingScore`
 - `OpenAIServingRerank`
 
-并按 `server_args.warmups` 执行预热请求，最后启动 `warmup_thread`。
+并执行 warmup 请求（如果启用）。因此 `/v1/*` 路由不是“直接调用 tokenizer manager”，而是先经过 OpenAI serving 对象做协议转换。
 
 ---
 
-## 3. `_launch_subprocesses` 深入：引擎如何被拼起来
+## 2. 入口二：Engine 直调与 HTTP 的同构关系
 
 文件：`python/sglang/srt/entrypoints/engine.py`
 
-`_launch_subprocesses(server_args, port_args=None)` 是 runtime 的“总装函数”。
+`Engine.__init__` 同样调用 `_launch_subprocesses(...)`，`Engine.generate(...)` 最终同样走 `tokenizer_manager.generate_request(...)`。
 
-### 3.1 初始化阶段
-顺序是：
+所以 HTTP 与 Engine 只是在“入口协议层”不同：
 
-1. `configure_logger(server_args)`
-2. `server_args.check_server_args()`
-3. `_set_envs_and_config(server_args)`
+- HTTP：JSON/SSE + FastAPI
+- Engine：Python 方法调用 + 迭代器/字典返回
 
-`_set_envs_and_config` 会做：
-- 设置 NCCL/CUDA/Triton 环境（如 `NCCL_NVLS_ENABLE`, `CUDA_MODULE_LOADING`）
-- `set_ulimit()`
-- flashinfer / sgl-kernel 版本校验
-- 注册 `SIGCHLD` / `SIGQUIT` 处理：子进程异常时主进程执行 `kill_process_tree`
-- `mp.set_start_method("spawn", force=True)`
-
-### 3.2 IPC 与模型路径
-- 若未给 `port_args`，调用 `PortArgs.init_new(server_args)` 分配通信端口。
-- `prepare_model_and_tokenizer(...)` 处理模型路径（含 modelscope 下载/解析场景）。
-
-### 3.3 Scheduler 进程拓扑
-按 `dp_size` 分支：
-
-#### 分支 A：`dp_size == 1`
-按 `TP x PP` 组合循环创建多个 `run_scheduler_process(...)`：
-- 每个进程有独立 `gpu_id/tp_rank/pp_rank`
-- 通过 `mp.Pipe` 给主进程回传 `ready` 状态
-
-#### 分支 B：`dp_size > 1`
-先启动 `run_data_parallel_controller_process(...)`，由其控制数据并行行为。
-
-### 3.4 非 0 节点特殊路径
-多节点时，`node_rank >= 1` 节点一般不跑 tokenizer/detokenizer：
-- 等待 scheduler ready
-- 可能启动 dummy health server
-- 阻塞等待子进程结束
-
-### 3.5 主节点补齐剩余组件
-`node_rank == 0` 时继续：
-1. 启动 detokenizer 子进程：`run_detokenizer_process(...)`
-2. 主进程初始化 `TokenizerManager(server_args, port_args)`
-3. 初始化 `TemplateManager.initialize_templates(...)`
-4. 等待 scheduler 的 pipe 回传 `{"status":"ready", ...}`
-5. 将 `max_req_input_len` 回填到 tokenizer manager
-
-这一步结束后，引擎才算“具备接单能力”。
+但**推理执行路径（tokenizer/scheduler/detokenizer）是共用的**。这点对排查问题非常关键：HTTP 复现不了时可以直接拿 Engine 缩短链路做最小复现。
 
 ---
 
-## 4. HTTP 路由层：请求从哪里进入
+## 3. `_launch_subprocesses`：SRT 进程拓扑真正装配点
+
+文件：`python/sglang/srt/entrypoints/engine.py`
+
+这是整个系统的“总装函数”。
+
+### 3.1 启动前配置
+
+先做基础环境与守护逻辑：
+
+- `configure_logger(server_args)`
+- `server_args.check_server_args()`
+- `_set_envs_and_config(server_args)`
+
+其中 `_set_envs_and_config` 典型动作：
+
+- 设置 CUDA/NCCL/内核相关环境变量
+- `set_ulimit()`
+- 内核/依赖检查（如 flashinfer）
+- 安装 `SIGCHLD` 等处理器，子进程异常时触发进程树清理
+- `mp.set_start_method("spawn", force=True)`
+
+### 3.2 通信端口和模型路径
+
+- `PortArgs.init_new(server_args)`：统一生成 IPC 地址/端口。
+- `prepare_model_and_tokenizer(...)`：模型路径规范化（可能触发下载/重写路径）。
+
+### 3.3 按并行策略拉起 scheduler 侧
+
+- `dp_size == 1`：按 TP/PP rank 启动一个或多个 `run_scheduler_process(...)`。
+- `dp_size > 1`：先起 `run_data_parallel_controller_process(...)`，由其驱动 DP 逻辑。
+
+每个 scheduler 子进程通过 `mp.Pipe` 给父进程返回 ready 信息（包含容量等元信息）。
+
+### 3.4 node_rank 分支
+
+多节点下通常只有 `node_rank==0` 承担 tokenizer/detokenizer 与 HTTP 协议层；其余节点主要运行 scheduler 计算分片。
+
+### 3.5 主节点补齐 Tokenizer/Detokenizer
+
+主节点继续完成：
+
+1. `run_detokenizer_process(...)`
+2. 主进程内创建 `TokenizerManager(...)`
+3. `TemplateManager.initialize_templates(...)`
+4. 等待 scheduler ready，并把 `max_req_input_len` 等回填到 tokenizer manager
+
+到这一步，系统才进入“可接单状态”。
+
+---
+
+## 4. HTTP 路由到 runtime：两条主入口
 
 文件：`python/sglang/srt/entrypoints/http_server.py`
 
-可以粗分三类 API：
+### 4.1 原生入口 `/generate`
 
-1. **原生 SRT API**
-   - `/generate`
-   - `/encode`
-   - `/classify`
-   - `/flush_cache`
-   - `/update_weights_from_*`
-   - `/set_internal_state` 等
+`generate_request(obj, request)` 按 `obj.stream` 分叉：
 
-2. **OpenAI 兼容 API**
-   - `/v1/chat/completions`
-   - `/v1/completions`
-   - `/v1/embeddings`
-   - `/v1/score`
-   - `/v1/rerank`
+- `stream=True`：返回 `StreamingResponse`，内部迭代 `tokenizer_manager.generate_request(...)` 并封装 SSE。
+- `stream=False`：直接 `__anext__()` 等到最终结果一次性返回。
 
-3. **健康与元数据 API**
-   - `/health`
-   - `/health_generate`
-   - `/get_model_info`
-   - `/get_server_info`
-   - `/get_load`
+### 4.2 OpenAI 入口 `/v1/chat/completions`
+
+路由层调用 `OpenAIServingChat.handle_request(...)`：
+
+1. 校验模型与参数。
+2. 把 OpenAI 请求对象转换成内部 `GenerateReqInput`。
+3. 后续执行链与 `/generate` 完全一致。
+
+**关键理解**：OpenAI 层是“请求重写层”，不是“另一套推理引擎”。
 
 ---
 
-## 5. `/generate` 精确调用链（最核心）
+## 5. TokenizerManager 深入：请求生命周期起点
 
-### 5.1 HTTP 层行为
-`generate_request(obj: GenerateReqInput, request: Request)`：
-
-- `obj.stream == True`：
-  - 返回 `StreamingResponse`
-  - 内部异步迭代 `tokenizer_manager.generate_request(...)`
-  - 每个 chunk 包装为 SSE：`data: {json}\n\n`
-  - 最后发送 `data: [DONE]`
-
-- `obj.stream == False`：
-  - 直接 `await ...generate_request(...).__anext__()`
-  - 一次性返回最终结果
-
-### 5.2 TokenizerManager：请求规范化与下发
 文件：`python/sglang/srt/managers/tokenizer_manager.py`
 
-#### 关键成员（初始化时建立）
-- `recv_from_detokenizer`（ZMQ PULL）
-- `send_to_scheduler`（ZMQ PUSH）
-- `rid_to_state`：请求状态表
-- 多种 communicator（权重更新、内部状态、LoRA 等控制面）
+`TokenizerManager` 是主进程中的“请求编排器 + IPC 汇聚器”。
 
-#### `generate_request(...)` 主流程
-1. 等待 `_updating` 结束（防止模型更新期并发冲突）
-2. `obj.normalize_batch_and_arguments()`
-3. 单请求：`_tokenize_one_request(obj)`
-4. `_send_one_request(...)` 发给 scheduler
-5. `_wait_one_response(...)` 等待 detokenizer 回包并 `yield`
-6. 批请求则走 `_handle_batch_request(...)`
+### 5.1 初始化中的关键通道
 
-#### `_tokenize_one_request(...)` 细节
-输入来源分三种：
-- `input_embeds`
+通常会建立：
+
+- `send_to_scheduler`（向 scheduler 下发）
+- `recv_from_detokenizer`（收 detokenizer 回包）
+- 控制面 communicator（abort/flush/update_weights/profile 等）
+- `rid_to_state`（请求状态索引）
+
+### 5.2 `generate_request(...)` 的分层逻辑
+
+主逻辑可以理解成 4 层：
+
+1. **并发闸门**：若正在更新权重/内部状态，等待 `_updating` 结束。
+2. **参数标准化**：`normalize_batch_and_arguments()`，统一单条/批量输入、默认参数。
+3. **输入变换**：`_tokenize_one_request(...)`（或批量分支）把 text/input_ids/input_embeds 统一成 tokenized 请求结构。
+4. **下发与等待**：`_send_one_request(...)` + `_wait_one_response(...)`，通过 rid 关联异步输出。
+
+### 5.3 `_tokenize_one_request(...)` 的关键细节
+
+输入源优先级通常是：
+
+- `input_embeds`（跳过文本 tokenize）
 - `input_ids`
-- `text`（需要 tokenizer 编码）
+- `text`（常规 tokenizer 编码）
 
-多模态请求（图/音频/视频）额外走：
-- `mm_processor.process_mm_data_async(...)`
+如果存在多模态字段，会触发 `mm_processor` 异步处理，产生可供 scheduler/executor 使用的多模态特征载荷。
 
-最后产出 tokenized request（包含采样参数、多模态特征、日志概率配置等）发送到 scheduler。
+最后产物是 `TokenizedGenerateReqInput`（包含 sampling params、logprob 选项、stop 条件、多模态上下文等），通过 IPC 发给 scheduler。
 
-### 5.3 Scheduler：调度与前向
-文件：`python/sglang/srt/managers/scheduler.py`
+### 5.4 后台回包循环
 
-`run_scheduler_process(...)` 会：
-1. 设置进程标题、日志、亲和性等
-2. `scheduler = Scheduler(...)`
-3. `pipe_writer.send({status: ready, ...})`
-4. 按模式进入事件循环
+TokenizerManager 还会持续从 `recv_from_detokenizer` 收消息，按 rid 更新状态并唤醒对应请求迭代器：
 
-#### 事件循环入口
-- `event_loop_normal`
-- `event_loop_overlap`
-- `event_loop_pp`
-- disaggregation prefill/decode 对应 loop
-
-#### 每轮循环共性
-```text
-recv_requests()
-  -> process_input_requests(recv_reqs)
-  -> 形成 prefill/decode batch
-  -> model forward
-  -> send_to_detokenizer（token ids / embedding / mm decode req）
-```
-
-`process_input_requests(...)` 通过 dispatcher 将输入分流：
-- `TokenizedGenerateReqInput` -> 生成类请求入队
-- `TokenizedEmbeddingReqInput` -> embedding/reward 请求
-- Abort/Flush/Profile/UpdateWeights 等控制消息
-
-### 5.4 Detokenizer：增量解码与 stop 裁剪
-文件：`python/sglang/srt/managers/detokenizer_manager.py`
-
-`event_loop()`：
-1. `recv_from_scheduler.recv_pyobj()`
-2. 基于类型分发：
-   - `BatchEmbeddingOut`
-   - `BatchTokenIDOut`
-   - `BatchMultimodalDecodeReq`
-3. `send_to_tokenizer.send_pyobj(output)`
-
-`handle_batch_token_id_out(...)` 的关键点：
-- 维护 `decode_status[rid]`（增量解码状态）
-- 先做 `batch_decode` 得到 `surr_texts/read_texts`
-- 按增量差分生成输出
-- 应用 `trim_matched_stop(...)`（stop string / stop token 裁剪）
-- 返回 `BatchStrOut`（含 tokens、logprobs、hidden states 等）
-
-### 5.5 回到 TokenizerManager 并最终返回
-TokenizerManager 的后台 loop 持续从 `recv_from_detokenizer` 接收消息：
-- 更新 `rid_to_state`
-- 将 chunk 推入请求对应的异步生成器
-- 完成时清理状态、统计指标
-
-HTTP 层随后把结果以 JSON（非流）或 SSE（流式）返回给客户端。
+- 流式请求：逐 chunk 推送
+- 非流式请求：等完成后一次产出
+- 异常/abort：传递错误并清理 `rid_to_state`
 
 ---
 
-## 6. `/v1/chat/completions` 详细链路（OpenAI 适配）
+## 6. Scheduler 深入：从请求入队到一次 decode 迭代
+
+文件：`python/sglang/srt/managers/scheduler.py`
+
+`run_scheduler_process(...)` 的骨架：
+
+1. 初始化进程上下文（日志、CPU 亲和、设备等）。
+2. 构造 `Scheduler(...)`。
+3. 通过 pipe 回传 ready。
+4. 进入某个 `event_loop_*`。
+
+### 6.1 为什么有多个 `event_loop_*`
+
+SGLang 会根据并行模式/优化路径选择不同循环：
+
+- normal
+- overlap
+- pipeline parallel (pp)
+- prefill/decode disaggregation 等
+
+虽然函数不同，但核心阶段一致：
+
+```text
+recv_requests
+  -> process_input_requests
+  -> schedule_next_batch (prefill/decode)
+  -> model_executor.forward
+  -> postprocess + send_to_detokenizer
+```
+
+### 6.2 `recv_requests` / `process_input_requests`
+
+这两步负责“控制面 + 数据面”统一收敛：
+
+- 生成请求（`TokenizedGenerateReqInput`）入等待队列。
+- embedding/score/rerank 请求走对应分支。
+- abort/flush/profile/update_weights 属于控制消息，改变 scheduler 内部状态机。
+
+### 6.3 prefill 与 decode 的调度核心
+
+实践中可把 scheduler 看成双阶段状态机：
+
+- **prefill**：新请求第一次计算 KV cache，成本高、吞吐敏感。
+- **decode**：已有 cache 上逐 token 增量生成，延迟敏感。
+
+scheduler 每轮会在显存预算、批大小、并发限制和公平性策略之间取平衡，决定：
+
+- 哪些请求进入本轮 prefill
+- 哪些请求继续 decode
+- 是否发生抢占、延后或提前终止
+
+### 6.4 executor 前向与输出
+
+模型执行后，scheduler 会把结果打包成批输出对象（如 token ids 批次或 embedding 批次），发往 detokenizer。对于生成请求，它通常携带：
+
+- 每个 rid 本轮新 token id（或结束标记）
+- 对应 logprob/top-logprob（如果开启）
+- hidden states（若请求要求）
+
+---
+
+## 7. DetokenizerManager 深入：为什么它能稳定增量输出
+
+文件：`python/sglang/srt/managers/detokenizer_manager.py`
+
+### 7.1 event loop 分发
+
+`event_loop()` 从 scheduler IPC 读对象后，按类型进入：
+
+- `BatchTokenIDOut`（最常见，文本生成）
+- `BatchEmbeddingOut`
+- `BatchMultimodalDecodeReq`
+
+### 7.2 `handle_batch_token_id_out(...)` 的增量逻辑
+
+核心是维护每个 rid 的 `decode_status`：
+
+1. 追加本轮 token ids。
+2. 批量 decode 为字符串（降低 tokenizer 调用开销）。
+3. 计算“新增长度差分”，只输出本轮新增文本片段。
+4. 应用 stop string / stop token 裁剪（`trim_matched_stop(...)`）。
+5. 打包 `BatchStrOut` 回发 tokenizer manager。
+
+这个“状态差分 + stop 裁剪”设计，是流式输出不重复、不漏字、不越界的关键。
+
+---
+
+## 8. OpenAI 适配层深入：`messages` 到 `prompt_ids`
 
 相关文件：
+
 - `python/sglang/srt/entrypoints/openai/serving_base.py`
 - `python/sglang/srt/entrypoints/openai/serving_chat.py`
 
-调用顺序：
+### 8.1 统一模板：`handle_request`
 
-1. 路由函数调用 `OpenAIServingChat.handle_request(...)`
-2. 基类 `OpenAIServingBase.handle_request(...)` 执行统一模板：
-   - `_validate_request`
-   - `_convert_to_internal_request`
-   - 按 `stream` 走 streaming/non-streaming
-3. `OpenAIServingChat._convert_to_internal_request(...)`：
-   - `_process_messages(...)`（messages/tool/template）
-   - `_build_sampling_params(...)`
-   - 构造内部 `GenerateReqInput`
-4. 之后进入与 `/generate` 完全一致的 runtime 通路
+`OpenAIServingBase` 提供通用序列：
 
-### 6.1 messages 如何变成 prompt
-`_process_messages(...)` 的两种路径：
-- 有模板名：`_apply_conversation_template(...)`
-- 无模板名：`_apply_jinja_template(...)`
+1. `_validate_request`
+2. `_convert_to_internal_request`
+3. streaming/non-streaming 输出封装
 
-`_apply_jinja_template(...)` 会：
-- 处理 multimodal content
-- 处理 tools 参数格式（含异常兜底）
-- `tokenizer.apply_chat_template(..., tokenize=True)` 得到 `prompt_ids`
-- 如需 `continue_final_message`，追加 assistant prefix token ids
+### 8.2 chat 请求转换关键点
 
-### 6.2 tool calling 约束
-当 `request.tools` 存在且 `tool_choice != "none"`：
-- 构建 `FunctionCallParser`
-- 生成结构化约束 `tool_call_constraint`
-- 注入采样参数，约束模型输出格式
+`OpenAIServingChat._convert_to_internal_request(...)` 主要做：
+
+- 处理 `messages`、system/developer/user/assistant 历史
+- 套 conversation template 或 jinja template
+- 构造 sampling params
+- tools/tool_choice 约束转内部结构化约束
+- 生成 `GenerateReqInput`
+
+也就是说，OpenAI 接口“复杂”主要在请求改写，而不是执行路径。
 
 ---
 
-## 7. Python Engine 模式：绕过 HTTP 的同构路径
+## 9. 一次完整请求的“函数级时序图”
 
-文件：`python/sglang/srt/entrypoints/engine.py`
-
-`Engine` 的关键结论：
-- `Engine.__init__` 同样调用 `_launch_subprocesses(...)`
-- `Engine.generate(...)` 同样创建 `GenerateReqInput`
-- 实际执行仍是 `tokenizer_manager.generate_request(...)`
-
-区别仅在入口协议层：
-- HTTP 模式：FastAPI + JSON/SSE
-- Engine 模式：Python 直接调用，返回 dict 或 iterator
-
-因此调试模型行为时，HTTP 与 Engine 大多数“推理内核”问题是复现一致的。
-
----
-
-## 8. DSL (`sglang.api`) 与 Runtime 的衔接点
-
-文件：`python/sglang/api.py`
-
-`api.py` 同时提供：
-
-1. DSL 构造能力：`gen/select/function/system/user/assistant...`
-2. runtime 入口：
-   - `Runtime(...)` -> `lang.backend.runtime_endpoint.Runtime`
-   - `Engine(...)` -> `srt.entrypoints.engine.Engine`
-
-也就是说 DSL 负责“表达任务”，Runtime 负责“执行任务”。
-
-补一句定位：
-- `lang/*` 更偏前端编排语义层
-- `srt/*` 更偏后端高性能执行层
-
----
-
-## 9. 关键数据结构（读码抓手）
-
-为了更快读懂调用链，建议先盯住这些类型：
-
-1. `ServerArgs` / `PortArgs`
-   - 决定了进程拓扑、通信端口、并行参数、运行模式
-
-2. `GenerateReqInput` / `EmbeddingReqInput`
-   - 请求统一载体（text/input_ids/mm_input/sampling_params/stream...）
-
-3. Scheduler 内部 `Req` / batch 结构
-   - 决定 prefill/decode 调度、缓存复用、并行分发
-
-4. `BatchTokenIDOut` / `BatchStrOut`
-   - detokenizer 前后核心交换结构
-
-从这些结构反向搜引用，能快速定位关键路径。
-
----
-
-## 10. 两张“实战追踪图”
-
-### 10.1 非流式 `/generate`
+### 9.1 非流式 `/generate`
 
 ```text
-Client POST /generate(stream=false)
-  -> http_server.generate_request
+Client
+  -> http_server.generate_request(stream=False)
   -> tokenizer_manager.generate_request(...).__anext__()
   -> _tokenize_one_request
-  -> send_to_scheduler
-  -> scheduler.recv_requests/process/batch/forward
-  -> send_to_detokenizer
-  -> detokenizer.decode -> BatchStrOut
-  -> tokenizer_manager 收包并完成该 rid
+  -> _send_one_request (IPC -> scheduler)
+  -> scheduler.event_loop_* : recv/process/schedule/forward
+  -> send BatchTokenIDOut (IPC -> detokenizer)
+  -> detokenizer.handle_batch_token_id_out
+  -> send BatchStrOut (IPC -> tokenizer)
+  -> tokenizer _wait_one_response 完成
   -> HTTP 返回最终 JSON
 ```
 
-### 10.2 流式 `/v1/chat/completions`
+### 9.2 流式 `/v1/chat/completions`
 
 ```text
-Client POST /v1/chat/completions(stream=true)
-  -> OpenAIServingChat.handle_request
-  -> _convert_to_internal_request(GenerateReqInput)
+Client
+  -> OpenAIServingChat.handle_request(stream=True)
+  -> _convert_to_internal_request -> GenerateReqInput
   -> tokenizer_manager.generate_request (async generator)
-  -> scheduler 循环多轮 decode
-  -> detokenizer 每轮输出增量文本
-  -> HTTP SSE: data: {...}\n\n
-  -> data: [DONE]
+  -> scheduler 多轮 decode
+  -> detokenizer 每轮输出 BatchStrOut
+  -> FastAPI StreamingResponse 持续输出 SSE chunk
+  -> [DONE]
 ```
 
 ---
 
-## 11. 建议的深度读码顺序（比“总览版”更具体）
+## 10. 深读代码建议：从“主链”切到“旁路”
 
-1. `python/sglang/launch_server.py`
-2. `python/sglang/srt/entrypoints/http_server.py`
-   - 重点：`launch_server`, `lifespan`, `/generate`, `/v1/*`
-3. `python/sglang/srt/entrypoints/engine.py`
-   - 重点：`_launch_subprocesses`, `Engine.generate`
-4. `python/sglang/srt/managers/tokenizer_manager.py`
-   - 重点：`__init__`, `generate_request`, `_tokenize_one_request`
-5. `python/sglang/srt/managers/scheduler.py`
-   - 重点：`run_scheduler_process`, `event_loop_*`, `recv_requests`, `process_input_requests`
-6. `python/sglang/srt/managers/detokenizer_manager.py`
-   - 重点：`event_loop`, `handle_batch_token_id_out`
-7. `python/sglang/srt/entrypoints/openai/serving_base.py`
-8. `python/sglang/srt/entrypoints/openai/serving_chat.py`
-9. `python/sglang/api.py`
+如果你想在“可改代码”层面继续深入，建议顺序：
+
+1. **主链必读**：
+   - `launch_server.py`
+   - `http_server.py`
+   - `engine.py`
+   - `tokenizer_manager.py`
+   - `scheduler.py`
+   - `detokenizer_manager.py`
+2. **协议扩展**：
+   - `entrypoints/openai/*`
+3. **调度策略细节**：
+   - scheduler 内部 admission/批处理策略与控制消息处理分支
+4. **性能关键点**：
+   - prefill/decode overlap
+   - 多模态 preprocess 路径
+   - detokenizer batch decode 与 stop 裁剪
 
 ---
 
-## 12. 一句话总结
+## 11. 最终总结（一句话）
 
-SGLang 的主干调用逻辑本质是：
+SGLang 的核心不是“某个 API 函数”，而是一个跨进程流水线状态机：
 
-**入口层（CLI/HTTP/Python） -> 协议适配层（原生/OpenAI/DSL） -> TokenizerManager（规范化与分发） -> Scheduler（调度与前向） -> Detokenizer（增量解码） -> 回传。**
+**入口协议层（HTTP/OpenAI/Engine）→ TokenizerManager（规范化/派发）→ Scheduler（批调度/前向）→ Detokenizer（增量解码/裁剪）→ 入口层回包。**
 
-只要按这条主线抓住关键数据结构与 event loop，就能从“能跑”走到“能改”。
+理解这条链后，再看任何功能（tool calling、多模态、权重热更新、并行策略）都只是挂在主链上的分支。
