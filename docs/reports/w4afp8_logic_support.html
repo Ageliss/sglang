@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SGLang w4afp8 代码逻辑与支持情况</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif; margin: 32px auto; max-width: 980px; line-height: 1.6; color: #1f2937; padding: 0 16px; }
+    h1, h2, h3 { color: #111827; }
+    code { background: #f3f4f6; padding: 2px 6px; border-radius: 4px; }
+    pre { background: #0b1020; color: #e5e7eb; padding: 14px; border-radius: 8px; overflow-x: auto; }
+    table { border-collapse: collapse; width: 100%; margin: 16px 0; }
+    th, td { border: 1px solid #d1d5db; padding: 10px; text-align: left; vertical-align: top; }
+    th { background: #f9fafb; }
+    .ok { color: #065f46; font-weight: 600; }
+    .warn { color: #92400e; font-weight: 600; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace; }
+  </style>
+</head>
+<body>
+  <h1>w4afp8 代码逻辑与支持情况（SGLang）</h1>
+  <p>本页面基于仓库内代码静态阅读整理，重点回答两件事：<strong>逻辑怎么走</strong>、<strong>当前支持到什么程度</strong>。</p>
+
+  <h2>1) 一句话结论</h2>
+  <ul>
+    <li><code>w4afp8</code> 是一种“混合量化”路径：<strong>普通 Linear 走 FP8</strong>，<strong>MoE 专家层走 W4A8（int4 weight + fp8 activation 的 kernel 路径）</strong>。</li>
+    <li>该路径对硬件有明确门槛：配置中要求 <span class="mono">compute capability &gt;= 90</span>（Hopper/SM90 级别）。</li>
+    <li>与 ROCm 的兼容列表中 <strong>未包含 w4afp8</strong>，因此当前主要是 CUDA/Hopper 场景。</li>
+  </ul>
+
+  <h2>2) 入口与识别逻辑</h2>
+  <h3>2.1 启动参数入口</h3>
+  <p>服务启动参数 <code>--quantization</code> 的可选值里包含 <code>w4afp8</code>，可显式指定。</p>
+
+  <h3>2.2 自动识别（模型配置）</h3>
+  <p>当模型目录下存在 <code>hf_quant_config.json</code> 且 <code>quant_algo == "MIXED_PRECISION"</code> 时，代码会自动映射为 <code>{"quant_method": "w4afp8"}</code>。</p>
+
+  <h2>3) 核心执行逻辑（按层类型分流）</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>层类型</th>
+        <th>w4afp8 下采用的方法</th>
+        <th>说明</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>LinearBase</code></td>
+        <td><code>Fp8LinearMethod</code></td>
+        <td>普通线性层沿用 FP8 线性实现；可通过 ignored_layers 跳过量化。</td>
+      </tr>
+      <tr>
+        <td><code>FusedMoE</code></td>
+        <td><code>W4AFp8MoEMethod</code></td>
+        <td>MoE 专家层创建 int8 容器存储压缩权重及 scale，并在加载后做 scale 交织和输入 scale 归一处理。</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>3.1 W4AFp8MoEMethod 关键步骤</h3>
+  <ol>
+    <li>创建专家参数：<code>w13_weight</code>、<code>w2_weight</code>（int8 张量容器）及对应 <code>_scale_inv</code>。</li>
+    <li>创建输入 scale：<code>w13_input_scale</code>、<code>w2_input_scale</code>。</li>
+    <li>预生成 grouped GEMM 所需 strides、offsets、problem size 缓冲。</li>
+    <li>加载后处理：对权重 scale 做“每 4 个一组交织（interleave）”，并把输入 scale 压成单一 max 值，便于 kernel 使用。</li>
+  </ol>
+
+  <h2>4) 支持情况（现状）</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>维度</th>
+        <th>状态</th>
+        <th>依据</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>CLI 可用</td>
+        <td class="ok">支持</td>
+        <td><code>--quantization</code> choices 含 <code>w4afp8</code>。</td>
+      </tr>
+      <tr>
+        <td>自动识别 MIXED_PRECISION</td>
+        <td class="ok">支持</td>
+        <td>模型量化配置解析时会映射到 <code>w4afp8</code>。</td>
+      </tr>
+      <tr>
+        <td>最小算力</td>
+        <td class="warn">要求高</td>
+        <td><code>get_min_capability()</code> 返回 90。</td>
+      </tr>
+      <tr>
+        <td>ROCm</td>
+        <td class="warn">当前不在支持列表</td>
+        <td>ROCm 支持量化方法白名单中未出现 <code>w4afp8</code>。</td>
+      </tr>
+      <tr>
+        <td>MoE kernel 形态</td>
+        <td class="ok">已实现且做了 shape 分支优化</td>
+        <td>SM90 cutlass grouped GEMM 路径对不同 <code>(n,k,m)</code> 选择不同 tile/cluster 配置。</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>5) 典型使用建议</h2>
+  <ul>
+    <li>优先在 Hopper（SM90）GPU 上使用。</li>
+    <li>若模型是 modelopt 的 MIXED_PRECISION 导出，可先不手工指定，验证自动识别是否命中 <code>w4afp8</code>。</li>
+    <li>排障时优先确认：量化方法是否被覆盖、是否为 ROCm 环境、MoE 维度是否落在常见优化分支。</li>
+  </ul>
+
+  <h2>6) 可复制命令（示例）</h2>
+  <pre><code>python -m sglang.launch_server \
+  --model &lt;your_model_or_path&gt; \
+  --quantization w4afp8 \
+  --dtype bfloat16</code></pre>
+
+  <p>（完）</p>
+</body>
+</html>
