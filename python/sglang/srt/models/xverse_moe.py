@@ -24,6 +24,9 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+    fused_moe_npu,
+)
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -33,7 +36,9 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.fused_moe_triton import fused_moe
+from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
+from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -43,7 +48,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, is_npu
 
 
 class XverseMLP(nn.Module):
@@ -121,6 +126,7 @@ class XverseMoE(nn.Module):
             ]
         )
         self.pack_params()
+        self.moe_runner_config = MoeRunnerConfig(inplace=True)
 
         self.router = ReplicatedLinear(
             config.hidden_size,
@@ -128,6 +134,10 @@ class XverseMoE(nn.Module):
             bias=False,
             quant_config=None,
             prefix=add_prefix("router", prefix),
+        )
+        self.topk = TopK(
+            top_k=self.top_k,
+            renormalize=getattr(self.config, "norm_topk_prob", False),
         )
 
         if config.num_shared_experts is not None:
@@ -140,6 +150,7 @@ class XverseMoE(nn.Module):
                 reduce_results=False,
                 prefix=add_prefix("shared_experts", prefix),
             )
+        self.fused_moe_method = fused_moe if not is_npu() else fused_moe_npu
 
     def pack_params(self):
         w1 = []
@@ -167,14 +178,13 @@ class XverseMoE(nn.Module):
             shared_output = self.shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.router(hidden_states)
-        final_hidden_states = fused_moe(
+        topk_output = self.topk(hidden_states, router_logits)
+        final_hidden_states = self.fused_moe_method(
             hidden_states,
             self.w1,
             self.w2,
-            router_logits,
-            self.top_k,
-            renormalize=getattr(self.config, "norm_topk_prob", False),
-            inplace=True,
+            topk_output,
+            self.moe_runner_config,
         )
 
         if self.config.num_shared_experts is not None:

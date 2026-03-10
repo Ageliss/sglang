@@ -15,6 +15,7 @@
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/a1a2aaadb9122f05667140e39cf67e5736c8b6d6/vllm/model_executor/models/transformers.py
 """Wrapper around `transformers` models"""
+
 import logging
 import re
 from typing import Iterable, Literal, Optional, Tuple, Union
@@ -211,15 +212,12 @@ class TransformersForCausalLM(nn.Module):
         Apply the model's tensor parallelization plan.
         Currently only supports linear layers.
         """
-        if not self.model.supports_tp_plan:
-            if tp_size <= 1:
-                return
+        tp_plan = getattr(self.model.config, "base_model_tp_plan", None) or {}
 
+        if not tp_plan and tp_size > 1:
             raise ValueError(
                 f"{type(self.model)} does not support tensor parallel yet!"
             )
-
-        tp_plan = self.model._tp_plan
 
         def _tensor_parallel(module: nn.Module, prefix: str = ""):
             for child_name, child_module in module.named_children():
