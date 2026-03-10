@@ -255,6 +255,72 @@ python3 -m sglang.launch_server \
   --trust-remote-code
 ```
 
+### H20 tuning notes for Qwen3-30B-A3B style MoE models
+
+If you observe latency spikes after increasing batching/concurrency on H20, use the following as a **benchmarking checklist** (not fixed gain guarantees):
+
+- `--page-size` default is `1`; for TRTLLM XQA decode on H20, use `--page-size 64`.
+- `trtllm_mha` is for **non-MLA** models and can be used by GQA/MQA-style attention models (for example, Qwen3-30B-A3B), while MLA models should use MLA backends.
+- FA4 is available in SGLang as an attention backend and examples include SM90/SM100 usage.
+
+1. **Decode backend first (`trtllm_mha` + `page-size 64`)**
+   - Prefer `--decode-attention-backend trtllm_mha --page-size 64` on H20/SM90 for decode-heavy traffic.
+   - Keep prefill backend unchanged initially (for example, FA3/FA4), then tune decode first.
+
+2. **Constrain scheduler pressure before raising concurrency**
+   - Increase `--schedule-conservativeness` (for example, `1.2` to `1.5`) if you see frequent retract/re-schedule behavior.
+   - Bound `--max-running-requests` explicitly instead of leaving it fully auto-tuned.
+
+3. **Control KV memory headroom for large batches**
+   - If high batching triggers instability (OOM/retractions), start with `--mem-fraction-static 0.8` and tune upward carefully.
+   - Pair this with `--chunked-prefill-size` tuning (for example, test `2048`, `4096`, `8192`) using your real prompt length mix.
+
+4. **Tune CUDA graph capture envelope to avoid graph/memory contention**
+   - Reduce `--cuda-graph-max-bs` if hangs or memory pressure appear after increasing batch size.
+   - Keep this aligned with expected steady-state batch distribution rather than peak burst batch size.
+
+5. **Be aware of current H20 limitation in allreduce fusion auto-enable**
+   - SGLang currently avoids auto-enabling FlashInfer allreduce fusion on H20 for affected MoE architectures due to an upstream issue; this is expected behavior.
+
+Example baseline for H20 + Qwen3-30B-A3B FP8 (balanced profile):
+
+```bash
+python3 -m sglang.launch_server \
+  --model-path Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 \
+  --tp 4 \
+  --attention-backend fa4 \
+  --decode-attention-backend trtllm_mha \
+  --page-size 64 \
+  --mem-fraction-static 0.8 \
+  --max-running-requests 96 \
+  --chunked-prefill-size 4096 \
+  --schedule-conservativeness 1.3
+```
+
+Low-latency-first starting profile (when high batch causes stutter):
+
+```bash
+python3 -m sglang.launch_server \
+  --model-path Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 \
+  --tp 4 \
+  --attention-backend fa4 \
+  --decode-attention-backend trtllm_mha \
+  --page-size 64 \
+  --mem-fraction-static 0.75 \
+  --max-running-requests 48 \
+  --chunked-prefill-size 2048 \
+  --schedule-conservativeness 0.8
+```
+
+Recommended latency tuning priority for this low-latency profile:
+
+1. Lower `--max-running-requests` first (usually the biggest latency/stability lever).
+2. Reduce `--chunked-prefill-size` if decode gets blocked by long prefill chunks.
+3. Lower `--schedule-conservativeness` for faster scheduling response, **but raise it back** if you see frequent retractions.
+4. Lower `--mem-fraction-static` as a stability fallback when memory pressure remains high.
+
+There is no universal uplift number for these knobs in upstream docs because gains are workload-dependent. Measure by sweeping `--max-running-requests`, `--chunked-prefill-size`, `--schedule-conservativeness`, and `--cuda-graph-max-bs` on your own traffic mix (prompt length / output length / request arrival pattern) and compare TTFT, TPOT, and throughput.
+
 - FlashAttention 4 (MHA & MLA)
 ```bash
 # FA4 for both prefill and decode on SM90/SM100
